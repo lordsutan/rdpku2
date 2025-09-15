@@ -146,6 +146,30 @@ jobs:
           "TAILSCALE_IP=$ip4" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Write-Host "Tailscale IPv4: $ip4"
 
+      - name: RDP quick fix + diagnostics
+  shell: pwsh
+  run: |
+    Write-Host "=== Enabling built-in Remote Desktop firewall rules ==="
+    netsh advfirewall firewall set rule group="remote desktop" new enable=Yes
+
+    Write-Host "=== Recreate targeted inbound rule for Tailscale CGNAT ==="
+    netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
+    netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow `
+      protocol=TCP localport=3389 remoteip=100.64.0.0/10 enable=yes profile=any
+
+    Write-Host "=== Confirm RDP service & listener ==="
+    Get-Service TermService | Format-Table Status,Name,DisplayName
+    Get-NetTCPConnection -State Listen -LocalPort 3389 | Format-Table LocalAddress,LocalPort,State,OwningProcess
+
+    Write-Host "=== Show Tailscale status & IPs ==="
+    $ts = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+    & $ts status
+    & $ts ip -4
+
+    Write-Host "=== Local TCP test ==="
+    Test-NetConnection 127.0.0.1 -Port 3389
+    
+
       # --- 5) Quick local port test (optional) ---
       - name: Verify RDP Accessibility
         shell: pwsh
