@@ -6,66 +6,144 @@ on:
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 3600
+    timeout-minutes: 1440  # keep alive up to 24h
 
     steps:
+      # --- 0) Preflight: show we're really running this YAML ---
+      - name: Preflight
+        shell: pwsh
+        run: |
+          Write-Host "Loaded steps: Preflight, Configure RDP, Create User, Install Tailscale, Connect Tailscale, Verify RDP, Maintain Connection"
+
+      # --- 1) Configure RDP (SECURE: NLA + TLS; firewall limited to Tailscale CGNAT) ---
       - name: Configure Core RDP Settings
         shell: pwsh
         run: |
           # Enable Remote Desktop
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name "fDenyTSConnections" -Value 0 -Force
+            -Name 'fDenyTSConnections' -Value 0 -Force
 
-          # (As in your original) Disable NLA and set SecurityLayer = 0
-          # If you want more security, set UserAuthentication=1 and SecurityLayer=2 instead.
+          # SECURE: Enforce NLA and TLS negotiate
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "UserAuthentication" -Value 0 -Force
+            -Name 'UserAuthentication' -Value 1 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "SecurityLayer" -Value 0 -Force
+            -Name 'SecurityLayer' -Value 2 -Force
 
-          # Remove any existing rule with the same name to avoid duplication
+          # If you insist on insecure (NOT recommended), uncomment:
+          # Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0 -Force
+          # Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'SecurityLayer' -Value 0 -Force
+
+          # Windows Firewall: allow 3389 **only** from Tailscale CGNAT range
           netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
-          
-          # For testing, allow any incoming connection on port 3389 (open to the internet)
-          # Recommend restricting to 100.64.0.0/10 (Tailscale) for safety.
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389 enable=yes
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow `
+            protocol=TCP localport=3389 remoteip=100.64.0.0/10 enable=yes profile=any
 
-          # Restart the Remote Desktop service to ensure changes take effect
+          # If you want it open to the internet (NOT recommended), instead:
+          # netsh advfirewall firewall add rule name="RDP-ANY" dir=in action=allow protocol=TCP localport=3389 enable=yes profile=any
+
           Restart-Service -Name TermService -Force
+          Write-Host "RDP enabled. NLA/TLS ON. Firewall limited to Tailscale CGNAT."
 
+      # --- 2) Create local user with strong password ---
       - name: Create RDP User with Secure Password
         shell: pwsh
         run: |
-          Add-Type -AssemblyName System.Security
-          $charSet = @{
-              Upper   = [char[]](65..90)      # A-Z
-              Lower   = [char[]](97..122)     # a-z
-              Number  = [char[]](48..57)      # 0-9
-              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
-          }
+          $name = "RDP"
+          # Strong random password (24 chars, avoid double quotes)
+          $chars = ([char[]](33..126)) | Where-Object { $_ -ne '"' }
+          $password = -join (1..24 | ForEach-Object { $chars | Get-Random })
+          $secure = ConvertTo-SecureString $password -AsPlainText -Force
 
-          $rawPassword = @()
-          $rawPassword += $charSet.Upper   | Get-Random -Count 4
-          $rawPassword += $charSet.Lower   | Get-Random -Count 4
-          $rawPassword += $charSet.Number  | Get-Random -Count 4
-          $rawPassword += $charSet.Special | Get-Random -Count 4
-          $password = -join ($rawPassword | Sort-Object { Get-Random })
-
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-
-          # Create user "RDP"
-          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
-            New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires | Out-Null
+          if (-not (Get-LocalUser -Name $name -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name $name -Password $secure -AccountNeverExpires | Out-Null
           } else {
-            # If it exists, reset password
-            Set-LocalUser -Name "RDP" -Password $securePass
+            Set-LocalUser -Name $name -Password $secure
           }
 
-          # Add to groups (kept your original: Administrators + Remote Desktop Users)
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
-          
-          # Export creds to env for later printing
-          "RDP_USER=RDP"       | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "RDP_PASSWORD=$password" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          # Least privilege (RDP only); uncomment admin if you truly need it
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $name -ErrorAction SilentlyContinue
+          # Add-LocalGroupMember -Group "Administrators" -Member $name -ErrorAction SilentlyContinue
+
+          if (-not (Get-LocalUser -Name $name)) { throw "User creation failed" }
+
+          "RDP_USER=$name"          | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RDP_PASSWORD=$password"  | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          Write-Host "Created user $name"
+
+      # --- 3) Install Tailscale (robust, no ArgumentList array issues) ---
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $ver = "1.82.0"
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-$ver-amd64.msi"
+          $installerPath = Join-Path $env:TEMP "tailscale.msi"
+
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+
+          & msiexec.exe /i "$installerPath" /quiet /norestart
+          if ($LASTEXITCODE -notin 0,3010) { throw "msiexec failed with exit code $LASTEXITCODE" }
+
+          Remove-Item $installerPath -Force
+          Write-Host "Tailscale installed."
+
+      # --- 4) Connect to Tailscale (with diagnostics + hard failures) ---
+      - name: Establish Tailscale Connection
+        shell: pwsh
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+            throw "TAILSCALE_AUTH_KEY is missing. If this is a fork, add the secret in the fork's repo."
+          }
+
+          $tsExe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+          if (-not (Test-Path $tsExe)) { throw "tailscale.exe not found at $tsExe" }
+
+          Write-Host "Tailscale version:"; & $tsExe version
+
+          # Reset any stale login, then bring up with key
+          & $tsExe logout | Out-Null
+          & $tsExe up --reset --authkey "$env:TAILSCALE_AUTH_KEY" --hostname "gh-win-${env:GITHUB_RUN_ID}" --ssh=false
+          if ($LASTEXITCODE -ne 0) { throw "tailscale up failed (bad/expired key or approval required)" }
+
+          # Wait for first IPv4
+          $ip4 = $null
+          for ($i=0; $i -lt 12 -and -not $ip4; $i++) {
+            $ip4 = (& $tsExe ip -4 | Select-Object -First 1).Trim()
+            if (-not $ip4) { Start-Sleep -Seconds 5 }
+          }
+          if (-not $ip4) {
+            Write-Host "Status dump:"; & $tsExe status
+            throw "Tailscale IP not assigned; device likely not registered."
+          }
+
+          "TAILSCALE_IP=$ip4" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Tailscale IPv4: $ip4"
+
+      # --- 5) Quick local port test (optional) ---
+      - name: Verify RDP Accessibility
+        shell: pwsh
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          $ok = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $ok.TcpTestSucceeded) {
+            Write-Warning "Local TCP 3389 test failed; you may still reach it from your device if ACLs allow."
+          } else {
+            Write-Host "TCP 3389 reachable locally."
+          }
+
+      # --- 6) Hold the runner so you can connect ---
+      - name: Maintain Connection
+        shell: pwsh
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address : $env:TAILSCALE_IP"
+          Write-Host "Username: $env:RDP_USER"
+          Write-Host "Password: $env:RDP_PASSWORD"
+          Write-Host "NLA/TLS : ENABLED"
+          Write-Host "==================`n"
+          while ($true) {
+            Write-Host "[$(Get-Date -Format o)] RDP active — stop the workflow to terminate."
+            Start-Sleep -Seconds 300
+          }
