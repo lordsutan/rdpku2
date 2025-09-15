@@ -6,193 +6,156 @@ on:
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 1440  # keep alive up to 24h
+    timeout-minutes: 3600
 
     steps:
-      # --- 0) Preflight ---
-      - name: Preflight
-        shell: pwsh
-        run: |
-          Write-Host "Steps: Preflight, Configure RDP, Create User, Install Tailscale, Connect Tailscale, Verify RDP, Maintain Connection"
-
-      # --- 1) Configure RDP (SECURE: NLA + TLS; firewall limited to Tailscale CGNAT) ---
-      - name: Configure Core RDP Settings
+      - name: Configure RDP (NLA/TLS) + Baseline Firewall
         shell: pwsh
         run: |
           # Enable Remote Desktop
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
             -Name 'fDenyTSConnections' -Value 0 -Force
 
-          # SECURE: Enforce NLA and TLS negotiate
+          # Secure RDP: NLA on (1), TLS negotiate (2)
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
             -Name 'UserAuthentication' -Value 1 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
             -Name 'SecurityLayer' -Value 2 -Force
 
-          # Firewall: allow 3389 ONLY from Tailscale CGNAT range
+          # Enable built-in Remote Desktop firewall group (all profiles)
+          netsh advfirewall firewall set rule group="remote desktop" new enable=Yes
+
+          # Replace custom inbound rule; restrict to Tailscale CGNAT only
           netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow `
             protocol=TCP localport=3389 remoteip=100.64.0.0/10 enable=yes profile=any
 
-          # (If you insist on open internet — NOT recommended)
-          # netsh advfirewall firewall add rule name="RDP-ANY" dir=in action=allow protocol=TCP localport=3389 enable=yes profile=any
-
+          # Ensure service is fresh
           Restart-Service -Name TermService -Force
-          Write-Host "RDP enabled. NLA/TLS ON. Firewall limited to Tailscale CGNAT."
 
-      # --- 2) Create local user with strong password ---
-      - name: Create RDP User with Secure Password
+      - name: Create RDP user with strong password
         shell: pwsh
         run: |
-          $name = "RDP"
-          # Strong 24-char password (avoid ")
-          $chars = ([char[]](33..126)) | Where-Object { $_ -ne '"' }
-          $password = -join (1..24 | ForEach-Object { $chars | Get-Random })
+          Add-Type -AssemblyName System.Security
+          $charSet = ([char[]](33..126)) | Where-Object { $_ -notin @('"') }  # avoid double quotes
+          $password = -join (1..24 | ForEach-Object { $charSet | Get-Random })
+
+          # Create or reset local user RDP
           $secure = ConvertTo-SecureString $password -AsPlainText -Force
-
-          if (-not (Get-LocalUser -Name $name -ErrorAction SilentlyContinue)) {
-            New-LocalUser -Name $name -Password $secure -AccountNeverExpires | Out-Null
+          if (-not (Get-LocalUser -Name 'RDP' -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name 'RDP' -Password $secure -AccountNeverExpires | Out-Null
           } else {
-            Set-LocalUser -Name $name -Password $secure
+            Set-LocalUser -Name 'RDP' -Password $secure
           }
 
-          # Least privilege (RDP only). Uncomment if you truly need admin:
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $name -ErrorAction SilentlyContinue
-          # Add-LocalGroupMember -Group "Administrators" -Member $name -ErrorAction SilentlyContinue
+          # Least privilege: Remote Desktop Users (uncomment next line for admin, if you truly need it)
+          Add-LocalGroupMember -Group 'Remote Desktop Users' -Member 'RDP' -ErrorAction SilentlyContinue
+          # Add-LocalGroupMember -Group 'Administrators' -Member 'RDP' -ErrorAction SilentlyContinue
 
-          if (-not (Get-LocalUser -Name $name)) { throw "User creation failed" }
+          if (-not (Get-LocalUser -Name 'RDP')) { throw 'User creation failed' }
 
-          "RDP_USER=$name"         | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "RDP_PASSWORD=$password" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          # Export for later display
+          "RDP_USER=RDP"             | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RDP_PASSWORD=$password"   | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-          Write-Host "Created user $name"
-
-      # --- 3) Install Tailscale (robust) ---
-      - name: Install Tailscale (robust)
+      - name: Install Tailscale
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
+          $version = "1.82.0"
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-$version-amd64.msi"
+          $msi = Join-Path $env:TEMP "tailscale.msi"
 
-          $ver = "1.82.0"
-          $uri = "https://pkgs.tailscale.com/stable/tailscale-setup-$ver-amd64.msi"
-          $msi = Join-Path $env:TEMP "tailscale-$ver.msi"
-          $log = Join-Path $env:TEMP "tailscale-install.log"
+          Invoke-WebRequest -Uri $url -OutFile $msi
 
-          # Skip if already installed (common on retries)
-          $tsExe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
-          if (Test-Path $tsExe) {
-            Write-Host "Tailscale already present at $tsExe — skipping MSI."
-            return
-          }
+          # Direct call to avoid Start-Process ArgumentList array issue
+          & msiexec.exe /i "$msi" /quiet /norestart
+          if ($LASTEXITCODE -notin 0,3010) { throw "msiexec failed: $LASTEXITCODE" }
 
-          Invoke-WebRequest -Uri $uri -OutFile $msi
+          Remove-Item $msi -Force
 
-          # Single ArgumentList string to avoid System.Object[]; full MSI log
-          $args = "/i `"$msi`" /qn /norestart ALLUSERS=1 /l*v `"$log`""
-
-          $proc = Start-Process -FilePath "msiexec.exe" -ArgumentList $args -Wait -PassThru -NoNewWindow
-          $code = $proc.ExitCode
-          Write-Host "msiexec exit code: $code"
-
-          if ($code -eq 1618) {
-            Write-Host "Another installation in progress (1618). Waiting 20s and retrying once..."
-            Start-Sleep -Seconds 20
-            $proc = Start-Process -FilePath "msiexec.exe" -ArgumentList $args -Wait -PassThru -NoNewWindow
-            $code = $proc.ExitCode
-            Write-Host "Retry exit code: $code"
-          }
-
-          if ($code -in 0,3010,1638) {
-            Write-Host "Tailscale install OK (exit $code)."
-          } else {
-            Write-Host "=== Tail of MSI log ==="
-            if (Test-Path $log) { Get-Content $log -Tail 200 | Write-Host }
-            throw "Tailscale install failed (msiexec exit code $code)"
-          }
-
-          Remove-Item $msi -Force -ErrorAction SilentlyContinue
-
-      # --- 4) Connect to Tailscale (diagnostics + hard fail if not registered) ---
-      - name: Establish Tailscale Connection
+      - name: Connect to Tailscale
         shell: pwsh
         env:
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
-            throw "TAILSCALE_AUTH_KEY is missing. If this is a fork, add the secret in the fork's repo."
-          }
+          $ts = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
 
-          $tsExe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
-          if (-not (Test-Path $tsExe)) { throw "tailscale.exe not found at $tsExe" }
-
-          Write-Host "Tailscale version:"; & $tsExe version
-
-          # Reset any stale login, then bring up with key
-          & $tsExe logout | Out-Null
-          & $tsExe up --reset --authkey "$env:TAILSCALE_AUTH_KEY" --hostname "gh-win-${env:GITHUB_RUN_ID}" --ssh=false
-          if ($LASTEXITCODE -ne 0) { throw "tailscale up failed (bad/expired key or approval required)" }
+          # Bring up with hostname; add --accept-dns=false if you prefer no DNS changes
+          & $ts up --authkey "$env:TAILSCALE_AUTH_KEY" --hostname "gh-win-${env:GITHUB_RUN_ID}" | Out-Null
 
           # Wait for first IPv4
-          $ip4 = $null
-          for ($i=0; $i -lt 12 -and -not $ip4; $i++) {
-            $ip4 = (& $tsExe ip -4 | Select-Object -First 1).Trim()
-            if (-not $ip4) { Start-Sleep -Seconds 5 }
+          $ip = $null
+          for ($i=0; $i -lt 12 -and -not $ip; $i++) {
+            $ip = (& $ts ip -4 | Select-Object -First 1).Trim()
+            Start-Sleep -Seconds 5
           }
-          if (-not $ip4) {
-            Write-Host "Status dump:"; & $tsExe status
-            throw "Tailscale IP not assigned; device likely not registered."
-          }
+          if (-not $ip) { throw "Tailscale IP not assigned" }
 
-          "TAILSCALE_IP=$ip4" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          Write-Host "Tailscale IPv4: $ip4"
+          "TAILSCALE_IP=$ip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: RDP quick fix + diagnostics
-  shell: pwsh
-  run: |
-    Write-Host "=== Enabling built-in Remote Desktop firewall rules ==="
-    netsh advfirewall firewall set rule group="remote desktop" new enable=Yes
-
-    Write-Host "=== Recreate targeted inbound rule for Tailscale CGNAT ==="
-    netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
-    netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow `
-      protocol=TCP localport=3389 remoteip=100.64.0.0/10 enable=yes profile=any
-
-    Write-Host "=== Confirm RDP service & listener ==="
-    Get-Service TermService | Format-Table Status,Name,DisplayName
-    Get-NetTCPConnection -State Listen -LocalPort 3389 | Format-Table LocalAddress,LocalPort,State,OwningProcess
-
-    Write-Host "=== Show Tailscale status & IPs ==="
-    $ts = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
-    & $ts status
-    & $ts ip -4
-
-    Write-Host "=== Local TCP test ==="
-    Test-NetConnection 127.0.0.1 -Port 3389
-    
-
-      # --- 5) Quick local port test (optional) ---
-      - name: Verify RDP Accessibility
         shell: pwsh
         run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          $ok = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $ok.TcpTestSucceeded) {
-            Write-Warning "Local TCP 3389 test failed; you may still reach it from your device if ACLs allow."
+          Write-Host "=== Ensure built-in RDP firewall group is enabled ==="
+          netsh advfirewall firewall set rule group="remote desktop" new enable=Yes
+
+          Write-Host "=== Recreate targeted inbound rule (Tailscale-only) ==="
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow `
+            protocol=TCP localport=3389 remoteip=100.64.0.0/10 enable=yes profile=any
+
+          Write-Host "=== Service & listener status ==="
+          Get-Service TermService | Format-Table Status,Name,DisplayName
+          Get-NetTCPConnection -State Listen -LocalPort 3389 | Format-Table LocalAddress,LocalPort,State,OwningProcess
+
+          Write-Host "=== Tailscale status & IPs ==="
+          $ts = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+          & $ts status
+          & $ts ip -4
+
+          Write-Host "=== Local TCP test (127.0.0.1:3389) ==="
+          Test-NetConnection 127.0.0.1 -Port 3389
+
+          Write-Host "=== Self Tailscale TCP test ($env:TAILSCALE_IP:3389) ==="
+          Test-NetConnection $env:TAILSCALE_IP -Port 3389
+
+      - name: Verify RDP accessibility (best-effort)
+        shell: pwsh
+        run: |
+          $ip = $env:TAILSCALE_IP
+          Write-Host "Tailscale IP: $ip"
+          $t = Test-NetConnection -ComputerName $ip -Port 3389
+          if (-not $t.TcpTestSucceeded) {
+            Write-Warning "Local TCP test to $ip:3389 failed here; you may still reach it from your device depending on Tailscale ACLs."
           } else {
-            Write-Host "TCP 3389 reachable locally."
+            Write-Host "TCP/3389 appears reachable."
           }
 
-      # --- 6) Hold the runner so you can connect ---
-      - name: Maintain Connection
+      - name: Show connection info & keep alive
         shell: pwsh
         run: |
-          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host ""
+          Write-Host "=== RDP ACCESS ==="
           Write-Host "Address : $env:TAILSCALE_IP"
-          Write-Host "Username: $env:RDP_USER"
+          Write-Host "Username: $env:RDP_USER   (use as .\$env:RDP_USER in mstsc)"
           Write-Host "Password: $env:RDP_PASSWORD"
           Write-Host "NLA/TLS : ENABLED"
-          Write-Host "==================`n"
+          Write-Host "=================="
+          Write-Host ""
+          Write-Host "Tip: On your Windows 11 PC -> Win+R -> mstsc -> Computer: $env:TAILSCALE_IP, User: .\$env:RDP_USER"
+          Write-Host ""
+
           while ($true) {
             Write-Host "[$(Get-Date -Format o)] RDP active — stop the workflow to terminate."
             Start-Sleep -Seconds 300
           }
+
+      # --- Optional: tag-based ACLs (uncomment and configure your tailnet ACLs) ---
+      # - name: Connect to Tailscale with tag
+      #   if: false  # set to true and disable the other Connect step if you want tagging
+      #   shell: pwsh
+      #   env:
+      #     TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      #   run: |
+      #     $ts = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+      #     & $ts up --authkey "$env:TAILSCALE_AUTH_KEY" --hostname "gh-win-${env:GITHUB_RUN_ID}" --advertise-tags "tag:rdp"
