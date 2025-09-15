@@ -9,11 +9,11 @@ jobs:
     timeout-minutes: 1440  # keep alive up to 24h
 
     steps:
-      # --- 0) Preflight: show we're really running this YAML ---
+      # --- 0) Preflight ---
       - name: Preflight
         shell: pwsh
         run: |
-          Write-Host "Loaded steps: Preflight, Configure RDP, Create User, Install Tailscale, Connect Tailscale, Verify RDP, Maintain Connection"
+          Write-Host "Steps: Preflight, Configure RDP, Create User, Install Tailscale, Connect Tailscale, Verify RDP, Maintain Connection"
 
       # --- 1) Configure RDP (SECURE: NLA + TLS; firewall limited to Tailscale CGNAT) ---
       - name: Configure Core RDP Settings
@@ -29,16 +29,12 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
             -Name 'SecurityLayer' -Value 2 -Force
 
-          # If you insist on insecure (NOT recommended), uncomment:
-          # Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0 -Force
-          # Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'SecurityLayer' -Value 0 -Force
-
-          # Windows Firewall: allow 3389 **only** from Tailscale CGNAT range
+          # Firewall: allow 3389 ONLY from Tailscale CGNAT range
           netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow `
             protocol=TCP localport=3389 remoteip=100.64.0.0/10 enable=yes profile=any
 
-          # If you want it open to the internet (NOT recommended), instead:
+          # (If you insist on open internet — NOT recommended)
           # netsh advfirewall firewall add rule name="RDP-ANY" dir=in action=allow protocol=TCP localport=3389 enable=yes profile=any
 
           Restart-Service -Name TermService -Force
@@ -49,7 +45,7 @@ jobs:
         shell: pwsh
         run: |
           $name = "RDP"
-          # Strong random password (24 chars, avoid double quotes)
+          # Strong 24-char password (avoid ")
           $chars = ([char[]](33..126)) | Where-Object { $_ -ne '"' }
           $password = -join (1..24 | ForEach-Object { $chars | Get-Random })
           $secure = ConvertTo-SecureString $password -AsPlainText -Force
@@ -60,34 +56,63 @@ jobs:
             Set-LocalUser -Name $name -Password $secure
           }
 
-          # Least privilege (RDP only); uncomment admin if you truly need it
+          # Least privilege (RDP only). Uncomment if you truly need admin:
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member $name -ErrorAction SilentlyContinue
           # Add-LocalGroupMember -Group "Administrators" -Member $name -ErrorAction SilentlyContinue
 
           if (-not (Get-LocalUser -Name $name)) { throw "User creation failed" }
 
-          "RDP_USER=$name"          | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "RDP_PASSWORD=$password"  | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RDP_USER=$name"         | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RDP_PASSWORD=$password" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
           Write-Host "Created user $name"
 
-      # --- 3) Install Tailscale (robust, no ArgumentList array issues) ---
-      - name: Install Tailscale
+      # --- 3) Install Tailscale (robust) ---
+      - name: Install Tailscale (robust)
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+
           $ver = "1.82.0"
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-$ver-amd64.msi"
-          $installerPath = Join-Path $env:TEMP "tailscale.msi"
+          $uri = "https://pkgs.tailscale.com/stable/tailscale-setup-$ver-amd64.msi"
+          $msi = Join-Path $env:TEMP "tailscale-$ver.msi"
+          $log = Join-Path $env:TEMP "tailscale-install.log"
 
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          # Skip if already installed (common on retries)
+          $tsExe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+          if (Test-Path $tsExe) {
+            Write-Host "Tailscale already present at $tsExe — skipping MSI."
+            return
+          }
 
-          & msiexec.exe /i "$installerPath" /quiet /norestart
-          if ($LASTEXITCODE -notin 0,3010) { throw "msiexec failed with exit code $LASTEXITCODE" }
+          Invoke-WebRequest -Uri $uri -OutFile $msi
 
-          Remove-Item $installerPath -Force
-          Write-Host "Tailscale installed."
+          # Single ArgumentList string to avoid System.Object[]; full MSI log
+          $args = "/i `"$msi`" /qn /norestart ALLUSERS=1 /l*v `"$log`""
 
-      # --- 4) Connect to Tailscale (with diagnostics + hard failures) ---
+          $proc = Start-Process -FilePath "msiexec.exe" -ArgumentList $args -Wait -PassThru -NoNewWindow
+          $code = $proc.ExitCode
+          Write-Host "msiexec exit code: $code"
+
+          if ($code -eq 1618) {
+            Write-Host "Another installation in progress (1618). Waiting 20s and retrying once..."
+            Start-Sleep -Seconds 20
+            $proc = Start-Process -FilePath "msiexec.exe" -ArgumentList $args -Wait -PassThru -NoNewWindow
+            $code = $proc.ExitCode
+            Write-Host "Retry exit code: $code"
+          }
+
+          if ($code -in 0,3010,1638) {
+            Write-Host "Tailscale install OK (exit $code)."
+          } else {
+            Write-Host "=== Tail of MSI log ==="
+            if (Test-Path $log) { Get-Content $log -Tail 200 | Write-Host }
+            throw "Tailscale install failed (msiexec exit code $code)"
+          }
+
+          Remove-Item $msi -Force -ErrorAction SilentlyContinue
+
+      # --- 4) Connect to Tailscale (diagnostics + hard fail if not registered) ---
       - name: Establish Tailscale Connection
         shell: pwsh
         env:
