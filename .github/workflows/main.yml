@@ -58,13 +58,21 @@ jobs:
           }
 
       - name: Install Tailscale
-        run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-          
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", ""$installerPath"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
+      shell: pwsh
+  run: |
+    $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+    $installerPath = Join-Path $env:TEMP "tailscale.msi"
+
+    Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+
+    # Direct call gives a real $LASTEXITCODE
+    & msiexec.exe /i "$installerPath" /quiet /norestart
+    if ($LASTEXITCODE -notin 0,3010) {
+      throw "msiexec failed with exit code $LASTEXITCODE"
+    }
+
+    Remove-Item $installerPath -Force
+
 
       - name: Establish Tailscale Connection
         run: |
